@@ -30,6 +30,7 @@ MAX_CONCURRENT = 200        # عدد المصادر التي تُسحب بنفس
 CACHE_TTL = 60              # مدة بقاء النتيجة قبل إعادة السحب (ثانية)
 PAGE_CHARS = 3600           # حجم الصفحة الواحدة من البروكسيات
 SESSION_TTL = 1800          # مدة بقاء جلسة العرض (ثانية)
+TARGET_ENDPOINT = "/receive-proxies"  # مسار الاستقبال (إن وجد)
 
 DEFAULT_START = (
     "<b>◈ بوت استخراج البروكسيات ◈</b>\n\n"
@@ -302,6 +303,24 @@ async def fetch_one(session: aiohttp.ClientSession, sem: asyncio.Semaphore, url:
     return parse(text)
 
 
+# ======================= دالة الإرسال المستقلة =======================
+async def send_proxies_to_target(proxies_list: list, target_ip: str, target_port: str):
+    """تقوم بإرسال البروكسيات المسحوبة تلقائياً إلى الأيبي والبورت المحدد"""
+    target_url = f"http://{target_ip}:{target_port}{TARGET_ENDPOINT}"
+    payload = {"proxies": proxies_list}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                target_url, json=payload, timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                if response.status == 200:
+                    print(f"[✓] تم إرسال {len(proxies_list)} بروكسي إلى السيرفر بنجاح.")
+                else:
+                    print(f"[×] فشل الإرسال، كود الاستجابة: {response.status}")
+    except Exception as e:
+        print(f"[×] خطأ أثناء إرسال البروكسيات للسيرفر: {e}")
+
+
 STATS = {"sources": len(SOURCES), "ok": 0, "failed": 0, "total": 0, "seconds": 0.0, "time": None}
 _cache = {"ts": 0.0, "data": []}
 _lock = asyncio.Lock()
@@ -386,6 +405,7 @@ def persist_to_git():
 router = Router()
 SESS: dict = {}
 WAIT_START: set = set()
+WAIT_TARGET: set = set()  # لتتبع المستخدمين الذين يكتبون الآيبي والبورت
 
 
 def menu_kb(uid: int) -> InlineKeyboardMarkup:
@@ -428,36 +448,102 @@ async def safe_edit(msg: Message, text: str, kb=None):
 @router.message(CommandStart())
 async def cmd_start(m: Message):
     WAIT_START.discard(m.from_user.id)
+    WAIT_TARGET.discard(m.from_user.id)
     await m.answer(load_start(), reply_markup=menu_kb(m.from_user.id))
 
 
 @router.callback_query(F.data == "menu")
 async def cb_menu(c: CallbackQuery):
     WAIT_START.discard(c.from_user.id)
+    WAIT_TARGET.discard(c.from_user.id)
     await c.answer()
     await safe_edit(c.message, load_start(), menu_kb(c.from_user.id))
 
 
 @router.callback_query(F.data == "ext")
 async def cb_extract(c: CallbackQuery):
+    WAIT_TARGET.add(c.from_user.id)
     await c.answer()
-    await safe_edit(c.message, "<b>◈ جاري السحب من المصادر ...</b>")
-    proxies = await get_proxies()
-    if not proxies:
-        await safe_edit(
-            c.message,
-            "<b>◈ لم يتم العثور على بروكسيات حاليا</b>",
-            InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="◂ القائمة", callback_data="menu")]]
-            ),
+    await safe_edit(
+        c.message,
+        "<b>◈ أدخل الآيبي والبورت</b>\n\n"
+        "▸ أرسل الآن الآيبي والبورت مفصولين بمسافة (مثال):\n"
+        "<code>91.108.9.211 32000</code>\n\n"
+        "▸ أو اكتب <b>إقاف</b> للرجوع للقائمة.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="◂ إلغاء", callback_data="menu")]]
+        ),
+    )
+
+
+@router.message(F.text)
+async def handle_user_text(m: Message):
+    uid = m.from_user.id
+    text = m.text.strip()
+
+    # إذا كتب "إيقاف" أو "إلغاء"
+    if text in ["إيقاف", "الغاء", "إلغاء"]:
+        WAIT_START.discard(uid)
+        WAIT_TARGET.discard(uid)
+        await m.answer(
+            "<b>◈ تم الإلغاء بنجاح.</b>",
+            reply_markup=menu_kb(uid),
         )
         return
-    now = time.time()
-    for k in [k for k, v in SESS.items() if now - v["ts"] > SESSION_TTL]:
-        SESS.pop(k, None)
-    sess = {"pages": build_pages(proxies), "total": len(proxies), "ts": now}
-    SESS[c.from_user.id] = sess
-    await safe_edit(c.message, page_text(sess, 0), page_kb(0, len(sess["pages"])))
+
+    # إذا كان بانتظار إدخال الآيبي والبورت
+    if uid in WAIT_TARGET:
+        WAIT_TARGET.discard(uid)
+        parts = text.split()
+        if len(parts) != 2:
+            await m.answer(
+                "<b>[×] الصيغة غير صحيحة!</b> يرجى إرسال الآيبي والبورت بهذا الشكل حصراً:\n<code>91.108.9.211 32000</code>",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="◂ القائمة", callback_data="menu")]]
+                ),
+            )
+            return
+
+        target_ip, target_port = parts[0], parts[1]
+        processing_msg = await m.answer("<b>◈ جاري السحب من المصادر ...</b>")
+
+        proxies = await get_proxies()
+        if not proxies:
+            await processing_msg.edit_text(
+                "<b>◈ لم يتم العثور على بروكسيات حاليا</b>",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="◂ القائمة", callback_data="menu")]]
+                ),
+            )
+            return
+
+        # إرسال البروكسيات تلقائياً إلى الآيبي والبورت المدخل
+        await processing_msg.edit_text(
+            f"<b>[✓] تم سحب {len(proxies)} بروكسي وجاري إرسالها إلى {target_ip}:{target_port} ...</b>"
+        )
+        asyncio.create_task(send_proxies_to_target(proxies, target_ip, target_port))
+
+        now = time.time()
+        for k in [k for k, v in SESS.items() if now - v["ts"] > SESSION_TTL]:
+            SESS.pop(k, None)
+        sess = {"pages": build_pages(proxies), "total": len(proxies), "ts": now}
+        SESS[uid] = sess
+
+        await processing_msg.edit_text(
+            page_text(sess, 0), reply_markup=page_kb(0, len(sess["pages"]))
+        )
+        return
+
+    # إذا كان بانتظار تغيير كليشة ستارت (للمالك)
+    if uid == OWNER_ID and uid in WAIT_START:
+        WAIT_START.discard(uid)
+        save_start(m.html_text)
+        await asyncio.to_thread(persist_to_git)
+        await m.answer(
+            "<b>◈ تم حفظ الكليشة الجديدة</b>",
+            reply_markup=menu_kb(uid),
+        )
+        return
 
 
 @router.callback_query(F.data.startswith("pg:"))
@@ -509,21 +595,6 @@ async def cb_change(c: CallbackQuery):
         "▸ يدعم التنسيق (غامق، مائل، روابط)",
         InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="◂ إلغاء", callback_data="menu")]]
-        ),
-    )
-
-
-@router.message(F.from_user.id == OWNER_ID, F.text)
-async def owner_text(m: Message):
-    if m.from_user.id not in WAIT_START:
-        return
-    WAIT_START.discard(m.from_user.id)
-    save_start(m.html_text)
-    await asyncio.to_thread(persist_to_git)
-    await m.answer(
-        "<b>◈ تم حفظ الكليشة الجديدة</b>",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="◂ القائمة", callback_data="menu")]]
         ),
     )
 
