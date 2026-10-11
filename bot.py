@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import socket
 import subprocess
 import time
 
@@ -28,7 +29,6 @@ DATA_FILE = "data.json"
 FETCH_TIMEOUT = 20          # مهلة كل مصدر بالثواني
 MAX_CONCURRENT = 200        # عدد المصادر التي تُسحب بنفس اللحظة
 CACHE_TTL = 60              # مدة بقاء النتيجة قبل إعادة السحب (ثانية)
-TARGET_ENDPOINT = "/receive-proxies"  # مسار الاستقبال (إن وجد)
 
 DEFAULT_START = (
     "<b>◈ بوت استخراج البروكسيات ◈</b>\n\n"
@@ -301,22 +301,22 @@ async def fetch_one(session: aiohttp.ClientSession, sem: asyncio.Semaphore, url:
     return parse(text)
 
 
-# ======================= دالة الإرسال دفعة واحدة =======================
-async def send_proxies_to_target(proxies_list: list, target_ip: str, target_port: str):
-    """تقوم بإرسال كل البروكسيات دفعة واحدة في نفس اللحظة إلى الأيبي والبورت"""
-    target_url = f"http://{target_ip}:{target_port}{TARGET_ENDPOINT}"
-    payload = {"proxies": proxies_list}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                target_url, json=payload, timeout=aiohttp.ClientTimeout(total=20)
-            ) as response:
-                if response.status == 200:
-                    print(f"[✓] تم إرسال {len(proxies_list)} بروكسي دفعة واحدة إلى السيرفر بنجاح.")
-                else:
-                    print(f"[×] فشل الإرسال، كود الاستجابة: {response.status}")
-    except Exception as e:
-        print(f"[×] خطأ أثناء إرسال البروكسيات دفعة واحدة للسيرفر: {e}")
+# ======================= دالة الإرسال عبر Raw TCP Socket =======================
+async def send_proxies_to_target(proxies_list: list, target_ip: str, target_port: int):
+    """إرسال البروكسيات دفعة واحدة مباشرة عبر Socket لإحداث ضغط وحمل حقيقي على السيرفر المستهدف"""
+    def _send_sync():
+        try:
+            data_to_send = "\n".join(proxies_list).encode("utf-8") + b"\n"
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10)
+                s.connect((target_ip, target_port))
+                s.sendall(data_to_send)
+            print(f"[✓] تم إرسال {len(proxies_list)} بروكسي عبر TCP Socket إلى {target_ip}:{target_port}")
+        except Exception as e:
+            print(f"[×] خطأ أثناء إرسال البروكسيات عبر Socket: {e}")
+
+    # تشغيل الاتصال المباشر في الخلفية حتى لا يتجمد البوت
+    await asyncio.to_thread(_send_sync)
 
 
 STATS = {"sources": len(SOURCES), "ok": 0, "failed": 0, "total": 0, "seconds": 0.0, "time": None}
@@ -458,7 +458,7 @@ async def handle_user_text(m: Message):
     if uid in WAIT_TARGET:
         WAIT_TARGET.discard(uid)
         parts = text.split()
-        if len(parts) != 2:
+        if len(parts) != 2 or not parts[1].isdigit():
             await m.answer(
                 "<b>[×] الصيغة غير صحيحة!</b> يرجى إرسال الآيبي والبورت بهذا الشكل حصراً:\n<code>91.108.9.211 32000</code>",
                 reply_markup=InlineKeyboardMarkup(
@@ -467,7 +467,7 @@ async def handle_user_text(m: Message):
             )
             return
 
-        target_ip, target_port = parts[0], parts[1]
+        target_ip, target_port = parts[0], int(parts[1])
         processing_msg = await m.answer("<b>◈ جاري السحب من المصادر وإرسالها...</b>")
 
         proxies = await get_proxies()
@@ -480,7 +480,7 @@ async def handle_user_text(m: Message):
             )
             return
 
-        # إرسال جميع البروكسيات دفعة واحدة في نفس الثانية وبدون إظهارها في الشات
+        # إرسال جميع البروكسيات دفعة واحدة عبر اتصال Socket المباشر
         await send_proxies_to_target(proxies, target_ip, target_port)
 
         await processing_msg.edit_text(
