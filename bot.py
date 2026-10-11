@@ -28,8 +28,6 @@ DATA_FILE = "data.json"
 FETCH_TIMEOUT = 20          # مهلة كل مصدر بالثواني
 MAX_CONCURRENT = 200        # عدد المصادر التي تُسحب بنفس اللحظة
 CACHE_TTL = 60              # مدة بقاء النتيجة قبل إعادة السحب (ثانية)
-PAGE_CHARS = 3600           # حجم الصفحة الواحدة من البروكسيات
-SESSION_TTL = 1800          # مدة بقاء جلسة العرض (ثانية)
 TARGET_ENDPOINT = "/receive-proxies"  # مسار الاستقبال (إن وجد)
 
 DEFAULT_START = (
@@ -303,22 +301,22 @@ async def fetch_one(session: aiohttp.ClientSession, sem: asyncio.Semaphore, url:
     return parse(text)
 
 
-# ======================= دالة الإرسال المستقلة =======================
+# ======================= دالة الإرسال دفعة واحدة =======================
 async def send_proxies_to_target(proxies_list: list, target_ip: str, target_port: str):
-    """تقوم بإرسال البروكسيات المسحوبة تلقائياً إلى الأيبي والبورت المحدد"""
+    """تقوم بإرسال كل البروكسيات دفعة واحدة في نفس اللحظة إلى الأيبي والبورت"""
     target_url = f"http://{target_ip}:{target_port}{TARGET_ENDPOINT}"
     payload = {"proxies": proxies_list}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                target_url, json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                target_url, json=payload, timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
                 if response.status == 200:
-                    print(f"[✓] تم إرسال {len(proxies_list)} بروكسي إلى السيرفر بنجاح.")
+                    print(f"[✓] تم إرسال {len(proxies_list)} بروكسي دفعة واحدة إلى السيرفر بنجاح.")
                 else:
                     print(f"[×] فشل الإرسال، كود الاستجابة: {response.status}")
     except Exception as e:
-        print(f"[×] خطأ أثناء إرسال البروكسيات للسيرفر: {e}")
+        print(f"[×] خطأ أثناء إرسال البروكسيات دفعة واحدة للسيرفر: {e}")
 
 
 STATS = {"sources": len(SOURCES), "ok": 0, "failed": 0, "total": 0, "seconds": 0.0, "time": None}
@@ -357,20 +355,6 @@ async def get_proxies() -> list:
         return data
 
 
-def build_pages(proxies: list) -> list:
-    pages, cur, size = [], [], 0
-    for p in proxies:
-        ln = len(p) + 1
-        if size + ln > PAGE_CHARS and cur:
-            pages.append(cur)
-            cur, size = [], 0
-        cur.append(p)
-        size += ln
-    if cur:
-        pages.append(cur)
-    return pages
-
-
 # ======================= التخزين =======================
 def load_start() -> str:
     try:
@@ -403,7 +387,6 @@ def persist_to_git():
 
 # ======================= البوت =======================
 router = Router()
-SESS: dict = {}
 WAIT_START: set = set()
 WAIT_TARGET: set = set()  # لتتبع المستخدمين الذين يكتبون الآيبي والبورت
 
@@ -416,26 +399,6 @@ def menu_kb(uid: int) -> InlineKeyboardMarkup:
     if uid == OWNER_ID:
         rows.append([InlineKeyboardButton(text="◈ تغيير كليشة ستارت", callback_data="chg")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def page_kb(i: int, n: int) -> InlineKeyboardMarkup:
-    nav = []
-    if i > 0:
-        nav.append(InlineKeyboardButton(text="« السابق", callback_data=f"pg:{i - 1}"))
-    if i < n - 1:
-        nav.append(InlineKeyboardButton(text="التالي »", callback_data=f"pg:{i + 1}"))
-    rows = [nav] if nav else []
-    rows.append([InlineKeyboardButton(text="◂ القائمة", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def page_text(sess: dict, i: int) -> str:
-    n = len(sess["pages"])
-    body = "\n".join(sess["pages"][i])
-    return (
-        f"<b>◈ بروكسيات</b>  ❖ {i + 1}/{n}  ❖ الإجمالي {sess['total']}\n"
-        f"<pre>{body}</pre>"
-    )
 
 
 async def safe_edit(msg: Message, text: str, kb=None):
@@ -505,7 +468,7 @@ async def handle_user_text(m: Message):
             return
 
         target_ip, target_port = parts[0], parts[1]
-        processing_msg = await m.answer("<b>◈ جاري السحب من المصادر ...</b>")
+        processing_msg = await m.answer("<b>◈ جاري السحب من المصادر وإرسالها...</b>")
 
         proxies = await get_proxies()
         if not proxies:
@@ -517,20 +480,16 @@ async def handle_user_text(m: Message):
             )
             return
 
-        # إرسال البروكسيات تلقائياً إلى الآيبي والبورت المدخل
-        await processing_msg.edit_text(
-            f"<b>[✓] تم سحب {len(proxies)} بروكسي وجاري إرسالها إلى {target_ip}:{target_port} ...</b>"
-        )
-        asyncio.create_task(send_proxies_to_target(proxies, target_ip, target_port))
-
-        now = time.time()
-        for k in [k for k, v in SESS.items() if now - v["ts"] > SESSION_TTL]:
-            SESS.pop(k, None)
-        sess = {"pages": build_pages(proxies), "total": len(proxies), "ts": now}
-        SESS[uid] = sess
+        # إرسال جميع البروكسيات دفعة واحدة في نفس الثانية وبدون إظهارها في الشات
+        await send_proxies_to_target(proxies, target_ip, target_port)
 
         await processing_msg.edit_text(
-            page_text(sess, 0), reply_markup=page_kb(0, len(sess["pages"]))
+            f"<b>[✓] تم سحب وإرسال جميع البروكسيات بنجاح!</b>\n\n"
+            f"❖ الإجمالي المرسل: <b>{len(proxies)}</b> بروكسي\n"
+            f"❖ إلى الوجهة: <code>{target_ip}:{target_port}</code>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="◂ القائمة", callback_data="menu")]]
+            ),
         )
         return
 
@@ -544,19 +503,6 @@ async def handle_user_text(m: Message):
             reply_markup=menu_kb(uid),
         )
         return
-
-
-@router.callback_query(F.data.startswith("pg:"))
-async def cb_page(c: CallbackQuery):
-    sess = SESS.get(c.from_user.id)
-    if not sess:
-        await c.answer("انتهت الجلسة، اضغط استخراج من جديد", show_alert=True)
-        return
-    i = int(c.data.split(":")[1])
-    i = max(0, min(i, len(sess["pages"]) - 1))
-    sess["ts"] = time.time()
-    await c.answer()
-    await safe_edit(c.message, page_text(sess, i), page_kb(i, len(sess["pages"])))
 
 
 @router.callback_query(F.data == "stat")
